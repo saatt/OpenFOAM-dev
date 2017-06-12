@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2013-2016 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2016 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -23,40 +23,36 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "LeastSquaresGrad.H"
-#include "LeastSquaresVectors.H"
+#include "leastSquaresGrad.H"
+#include "leastSquaresVectors.H"
 #include "gaussGrad.H"
 #include "fvMesh.H"
 #include "volMesh.H"
+#include "surfaceMesh.H"
+#include "GeometricField.H"
 #include "extrapolatedCalculatedFvPatchField.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-template<class Type, class Stencil>
+template<class Type>
 Foam::tmp
 <
     Foam::GeometricField
     <
         typename Foam::outerProduct<Foam::vector, Type>::type,
         Foam::fvPatchField,
-    Foam::volMesh
+        Foam::volMesh
     >
 >
-Foam::fv::LeastSquaresGrad<Type, Stencil>::calcGrad
+Foam::fv::leastSquaresGrad<Type>::calcGrad
 (
-    const GeometricField<Type, fvPatchField, volMesh>& vtf,
+    const GeometricField<Type, fvPatchField, volMesh>& vsf,
     const word& name
 ) const
 {
     typedef typename outerProduct<vector, Type>::type GradType;
 
-    const fvMesh& mesh = vtf.mesh();
-
-    // Get reference to least square vectors
-    const LeastSquaresVectors<Stencil>& lsv = LeastSquaresVectors<Stencil>::New
-    (
-        mesh
-    );
+    const fvMesh& mesh = vsf.mesh();
 
     tmp<GeometricField<GradType, fvPatchField, volMesh>> tlsGrad
     (
@@ -65,7 +61,7 @@ Foam::fv::LeastSquaresGrad<Type, Stencil>::calcGrad
             IOobject
             (
                 name,
-                vtf.instance(),
+                vsf.instance(),
                 mesh,
                 IOobject::NO_READ,
                 IOobject::NO_WRITE
@@ -74,64 +70,72 @@ Foam::fv::LeastSquaresGrad<Type, Stencil>::calcGrad
             dimensioned<GradType>
             (
                 "zero",
-                vtf.dimensions()/dimLength,
+                vsf.dimensions()/dimLength,
                 Zero
             ),
             extrapolatedCalculatedFvPatchField<GradType>::typeName
         )
     );
     GeometricField<GradType, fvPatchField, volMesh>& lsGrad = tlsGrad.ref();
-    Field<GradType>& lsGradIf = lsGrad;
 
-    const extendedCentredCellToCellStencil& stencil = lsv.stencil();
-    const List<List<label>>& stencilAddr = stencil.stencil();
-    const List<List<vector>>& lsvs = lsv.vectors();
+    // Get reference to least square vectors
+    const leastSquaresVectors& lsv = leastSquaresVectors::New(mesh);
 
-    // Construct flat version of vtf
-    // including all values referred to by the stencil
-    List<Type> flatVtf(stencil.map().constructSize(), Zero);
+    const surfaceVectorField& ownLs = lsv.pVectors();
+    const surfaceVectorField& neiLs = lsv.nVectors();
 
-    // Insert internal values
-    forAll(vtf, celli)
+    const labelUList& own = mesh.owner();
+    const labelUList& nei = mesh.neighbour();
+
+    forAll(own, facei)
     {
-        flatVtf[celli] = vtf[celli];
+        label ownFacei = own[facei];
+        label neiFacei = nei[facei];
+
+        Type deltaVsf = vsf[neiFacei] - vsf[ownFacei];
+
+        lsGrad[ownFacei] += ownLs[facei]*deltaVsf;
+        lsGrad[neiFacei] -= neiLs[facei]*deltaVsf;
     }
 
-    // Insert boundary values
-    forAll(vtf.boundaryField(), patchi)
+    // Boundary faces
+    forAll(vsf.boundaryField(), patchi)
     {
-        const fvPatchField<Type>& ptf = vtf.boundaryField()[patchi];
+        const fvsPatchVectorField& patchOwnLs = ownLs.boundaryField()[patchi];
 
-        label nCompact =
-            ptf.patch().start()
-          - mesh.nInternalFaces()
-          + mesh.nCells();
+        const labelUList& faceCells =
+            vsf.boundaryField()[patchi].patch().faceCells();
 
-        forAll(ptf, i)
+        if (vsf.boundaryField()[patchi].coupled())
         {
-            flatVtf[nCompact++] = ptf[i];
+            const Field<Type> neiVsf
+            (
+                vsf.boundaryField()[patchi].patchNeighbourField()
+            );
+
+            forAll(neiVsf, patchFacei)
+            {
+                lsGrad[faceCells[patchFacei]] +=
+                    patchOwnLs[patchFacei]
+                   *(neiVsf[patchFacei] - vsf[faceCells[patchFacei]]);
+            }
+        }
+        else
+        {
+            const fvPatchField<Type>& patchVsf = vsf.boundaryField()[patchi];
+
+            forAll(patchVsf, patchFacei)
+            {
+                lsGrad[faceCells[patchFacei]] +=
+                     patchOwnLs[patchFacei]
+                    *(patchVsf[patchFacei] - vsf[faceCells[patchFacei]]);
+            }
         }
     }
 
-    // Do all swapping to complete flatVtf
-    stencil.map().distribute(flatVtf);
 
-    // Accumulate the cell-centred gradient from the
-    // weighted least-squares vectors and the flattened field values
-    forAll(stencilAddr, celli)
-    {
-        const labelList& compactCells = stencilAddr[celli];
-        const List<vector>& lsvc = lsvs[celli];
-
-        forAll(compactCells, i)
-        {
-            lsGradIf[celli] += lsvc[i]*flatVtf[compactCells[i]];
-        }
-    }
-
-    // Correct the boundary conditions
     lsGrad.correctBoundaryConditions();
-    gaussGrad<Type>::correctBoundaryConditions(vtf, lsGrad);
+    gaussGrad<Type>::correctBoundaryConditions(vsf, lsGrad);
 
     return tlsGrad;
 }
